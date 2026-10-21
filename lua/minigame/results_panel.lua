@@ -1,33 +1,48 @@
 -------------------------------------------------------------------------------
--- results_panel.lua — the end-of-round screen.
+-- results_panel.lua — the end-of-round scoreboard (a pure VIEW).
 --
--- ATTACHED TO: the "Results" Container Control (sibling of PlayArea/Hud
--- under the root). The director calls Invoke("Show", ...) / Invoke("Hide").
+-- ATTACHED TO: the "Results" Container Control (child of the root, drawn over
+-- the Game screen).
 --
--- VISIBILITY vs ACTIVE (important!): this panel stays ACTIVE for the whole
--- stage and hides with SetVisible(false) (+ parking offscreen). A control
--- that starts INACTIVE may never run its OnStart — meaning this script's
--- ui refs would be nil the first time Show is invoked. Keep script-bearing
--- controls active; use SetVisible for hiding. (SetActive(false) also stops
--- event listeners and lifecycle functions — we want neither.)
+-- game_flow owns navigation and calls Invoke("Show", ...) / Invoke("Hide").
+-- This script owns nothing but its own text and slide-in animation. The three
+-- buttons (Next / Replay / Menu) are wired by game_flow like every other
+-- button in the game — one input owner for the whole UI.
+--
+-- VISIBILITY vs ACTIVE (important everywhere in this project): this panel
+-- stays ACTIVE for the whole stage and hides with SetVisible(false) + parking
+-- offscreen. A control that starts INACTIVE may never run its OnStart, so the
+-- script's ui refs would be nil the first time Show is invoked.
 --
 -- PATTERN TOUR:
---   [SCREENS]     show/hide with tweened slide-in (SetVisible, not SetActive)
---   [KEY INPUT]   keyboard + controller confirm listeners returning a boolean
---   [FOCUS]       game.SetControllerFocus so a gamepad can press the button
---   [TWEEN]       panel slide-in — a single killable Tween (TweenSequence
---                  has no documented Kill, so keep a Tween reference instead)
---   [LOCALIZATION]every string via game.GetText
+--   [VIEW ONLY]   no game state, no callbacks — flow pushes primitives in
+--   [SCREENS]     SetVisible (never SetActive) + a tweened slide-in
+--   [TWEEN LOCKS] slide tween is killable AND killed before we write anchors
+--   [LOCALIZATION]every visible string via game.GetText
 -------------------------------------------------------------------------------
 
 local ui = {}
 local shown = false
--- Slide-in tween kept as a reference so Hide can kill it: a live tween
--- LOCKS the fields it animates (anchors here), and Hide wants to park the
--- panel by writing those same fields directly.
+-- Slide-in tween kept as a reference so Hide can kill it: a live tween LOCKS
+-- the fields it animates (anchors here), and Hide wants to park the panel by
+-- writing those same fields directly.
 local slideTween = nil
 
-local function fmt(k, ...) return string.format(game.GetText("minigame." .. k), ...) end
+local COLOR_NEW_BEST = Color.FromRGB(255, 204, 0)
+local COLOR_COINS = Color.FromRGB(255, 214, 0)
+
+local function helpers()
+    local root = game.FindClientUIRoot("SmashGarden")
+    local h = root and root:GetScriptByPath("minigame/helpers")
+    if h and h.alive then return h end
+    return nil
+end
+
+-- Localized text with the embedded English fallback (see helpers.Text).
+local function txt(key, a, b, c)
+    local h = helpers()
+    return h and h:Invoke("Text", key, a, b, c) or key
+end
 
 local function hide()
     shown = false
@@ -42,59 +57,58 @@ local function hide()
     ui.panel:SetAnchorMax(1.2, 0.5)
 end
 
-function Show(score, hits, misses, bestCombo, bestScore)
-    if not ui.panel or shown then return end
+-- All primitives, one parameter each — the safest thing to marshal across
+-- script:Invoke. Order matches game_flow's call site.
+function Show(level, score, hits, misses, bestCombo, coins, newBest, stars, best, completed)
+    if not ui.panel then return end
     shown = true
 
-    ui.panel:SetVisible(true)
-    ui.scoreText.text  = fmt("final_score", score)
-    ui.statsText.text  = fmt("stats", hits, misses, bestCombo)
-    ui.bestText.text   = fmt("best", bestScore)
+    local h = helpers()
+    local starText = h and h:Invoke("FormatStars", stars) or ""
 
-    -- Slide in from the right (single tween; self-clears the reference
-    -- when it finishes so Hide won't try to kill a dead one).
+    ui.titleText.text  = txt("minigame.results_title")
+    ui.verdictText.text = txt(completed and "minigame.complete" or "minigame.failed")
+    ui.medalText.text  = starText
+    ui.scoreText.text  = txt("minigame.final_score", score)
+    ui.statsText.text  = txt("minigame.stats", hits, misses, bestCombo)
+    ui.coinsText.text  = txt("minigame.coins_earned", coins)
+    ui.bestText.text   = txt("minigame.best", best)
+    ui.newBestText:SetVisible(newBest and true or false)
+    ui.newBestText.text = txt("minigame.new_best")
+    ui.newBestText.fontColor = COLOR_NEW_BEST
+
     if slideTween then slideTween:Kill(false) end
+    ui.panel:SetVisible(true)
     slideTween = game.Tween(ui.panel, { anchorMinX = 0.5, anchorMaxX = 0.5 }, 0.35)
         :SetEase(Enum.EaseType.OutCubic)
         :SetOnComplete(function() slideTween = nil end)
     slideTween:Play()
 
-    -- Controller users need focus on a button to interact at all.
-    if game.GetDevice() == Enum.Device.Gamepad then
-        game.SetControllerFocus(ui.replayButton)
-    end
-    print("[results] shown, score=" .. tostring(score))
+    print(string.format("[results] shown: level=%d score=%d stars=%d coins=%d newBest=%s",
+        tonumber(level) or 0, tonumber(score) or 0, tonumber(stars) or 0,
+        tonumber(coins) or 0, tostring(newBest)))
 end
 
 function Hide()
     hide()
 end
 
+function IsShown()
+    return shown
+end
+
 function OnStart()
-    ui.panel        = script.object
-    ui.scoreText    = ui.panel:GetChild("FinalScoreText")
-    ui.statsText    = ui.panel:GetChild("StatsText")
-    ui.bestText     = ui.panel:GetChild("BestText")
-    ui.replayButton = ui.panel:GetChild("ReplayButton")
+    ui.panel = script.object
+    ui.titleText   = ui.panel:GetChild("TitleText")
+    ui.verdictText = ui.panel:GetChild("VerdictText")
+    ui.medalText   = ui.panel:GetChild("MedalText")
+    ui.scoreText   = ui.panel:GetChild("FinalScoreText")
+    ui.statsText   = ui.panel:GetChild("StatsText")
+    ui.coinsText   = ui.panel:GetChild("CoinsText")
+    ui.bestText    = ui.panel:GetChild("BestText")
+    ui.newBestText = ui.panel:GetChild("NewBestText")
 
-    local function replay()
-        if not shown then return false end
-        hide() -- the director restarts the round, which shows HUD again
-        local root = game.FindClientUIRoot("SmashGarden")
-        local dir = root and root:GetScriptByPath("minigame/director")
-        if dir and dir.alive then
-            dir:Invoke("OnReplayRequested")
-        end
-        return true -- consumed: stops other listeners in the chain
-    end
-
-    -- Key listeners live on the button control. The boolean return matters:
-    -- true = handled (stops the event reaching other listeners of the same
-    -- type), false = let the chain continue. Register BOTH keyboard and
-    -- controller variants — this is the controller-parity pattern.
-    ui.replayButton:AddKeyEventListener(Enum.KeyEventType.KeyboardInteractKeyUp, replay)
-    ui.replayButton:AddKeyEventListener(Enum.KeyEventType.ControllerJumpKeyUp, replay)
-
+    if ui.coinsText then ui.coinsText.fontColor = COLOR_COINS end
     hide() -- start hidden + parked offscreen
 end
 

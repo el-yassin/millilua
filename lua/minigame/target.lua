@@ -1,36 +1,33 @@
 -------------------------------------------------------------------------------
--- target.lua — one whackable target ("mole").
+-- target.lua — one whackable target.
 --
--- ATTACHED TO: the Target control TEMPLATE (the one the director spawns via
--- game.InstantiateClientUIControl). Every spawned instance runs its own copy
--- of this script — that's the mental model: template = class, instance = object.
+-- ATTACHED TO: every Target control TEMPLATE (normal / silver / golden /
+-- bomb / time — five templates, same script, different script vars).
+-- Every spawned instance runs its own copy of this script: template = class,
+-- instance = object.
 --
--- [GOLDEN TARGET] (exercise 4) The SAME script is mapped onto BOTH templates
--- (normal + golden). The golden template's mapping just sets
--- PointsMultiplier=5. The rule lives with the template, not in the director:
--- adding a third variant (silver? explosive?) = duplicate the template,
--- change two script vars, done. Zero Lua changes.
+-- SCRIPT VARIABLES (set per template in the Script Mapping menu):
+--   Kind             1 normal, 2 silver, 3 golden, 4 bomb, 5 time
+--   PointsMultiplier base point multiplier reported to the director
+--                     (normal 1, silver 2, golden 5; ignored by bomb/time)
 --
--- PATTERN TOUR:
---   [SELF-CONTAINED]   the target manages its own click reaction + scoring
---   [SCRIPT VARS]      per-template behavior via GetParam (PointsMultiplier)
---   [EVENT]            AddCursorEventListener with a CursorEventData payload
---   [TWEEN CHAIN]      squish on click -> director is told to clean up
---   [ALIVE CHECK]      script.alive guard before every cross-script Invoke
+-- RESPONSIBILITIES: react to a click ONCE, tell the director what kind it
+-- was, then play its own squish-and-die animation. The director owns all
+-- scoring policy (combo, fever, upgrades, penalties); the template only
+-- reports facts. The target also owns its death animation: the director
+-- never tweens a target's scale after the hit is reported (two tweens on
+-- one field would fight over the engine's field lock).
 -------------------------------------------------------------------------------
 
--- Per-template tuning from the Script Mapping menu. Read in OnInit, not at
--- top level: the mapping is only guaranteed loaded by then.
+local KIND = 1
 local POINTS_MULTIPLIER = 1
 
--- Tiny debounce: a fast double-click shouldn't double-score. The director
--- removes the target from its live list on the first hit, but the squish
--- tween below takes a moment, and clicks during it are still delivered.
+-- One-shot guard: the director drops us from its live list on the first
+-- report, but the squish animation takes a moment and clicks during it are
+-- still delivered to this control.
 local hit = false
 
 local function getDirector()
-    -- The director hangs off the root container, which every control can
-    -- reach by name regardless of depth in the hierarchy.
     local root = game.FindClientUIRoot("SmashGarden")
     if not root then return nil end
     local dir = root:GetScriptByPath("minigame/director")
@@ -46,33 +43,26 @@ local function onClick(_eventData)
     if not self_ or not self_.alive then return end
 
     -- Stop eating clicks immediately: the corpse below shrinks for ~0.18s
-    -- and shouldn't swallow the next click aimed at a fresh target.
+    -- and must not swallow the next click aimed at a fresh target.
     self_.raycastTarget = false
 
-    -- Report the kill BEFORE animating: the director drops us from its
-    -- live list immediately (a second click can't double-score, the
-    -- round-end sweep can't despawn us twice) and kills our pop-in tween
-    -- if it's still running — otherwise the squish below would tween the
-    -- same LOCKED scale fields. We report our MULTIPLIER, not points:
-    -- our worth is template data, the combo-based value is policy.
+    -- Report BEFORE animating (see header). Kind + multiplier travel up;
+    -- the director adds combo/fever/upgrade policy.
     local dir = getDirector()
     if not dir then
         printerr("[target] no live director to report hit to")
         return
     end
-    dir:Invoke("OnTargetClicked", self_.id, POINTS_MULTIPLIER)
+    dir:Invoke("OnTargetClicked", self_.id, KIND, POINTS_MULTIPLIER)
 
-    -- Squish: X flattens, Y stretches, then we shrink away.
-    -- WE own this animation — the director deliberately does NOT tween our
-    -- scale when we report the hit (two tweens on one field = tween-lock
-    -- conflict; fields are locked while a Tween plays).
+    -- Squish: X flattens, Y stretches, then we shrink away. WE own this
+    -- animation — the director deliberately does not tween us after the hit.
     local seq = game.TweenSequence()
     seq:Append(game.Tween(self_, { localScaleX = 1.4, localScaleY = 0.4 }, 0.06))
     local shrink = game.Tween(self_, { localScaleX = 0, localScaleY = 0 }, 0.12)
     shrink:SetOnComplete(function()
-        -- script.alive guards against the round ending mid-squish: the
-        -- director sweeps leftover targets wholesale and may have already
-        -- destroyed this control (and thus this script instance).
+        -- script.alive guards a round ending mid-squish: the director sweeps
+        -- leftover targets wholesale and may have destroyed this control.
         if script.alive and self_.alive then
             game.DestroyClientUIControl(self_)
         end
@@ -82,22 +72,20 @@ local function onClick(_eventData)
 end
 
 function OnInit()
+    KIND = tonumber(script:GetParam("Kind")) or 1
     POINTS_MULTIPLIER = tonumber(script:GetParam("PointsMultiplier")) or 1
 end
 
 function OnStart()
-    -- CursorEventArea is a separate component type: the spawned control must
-    -- HAVE one (add it in the editor template) or cursor events never fire.
+    -- The template root must have a CursorEventArea component or cursor
+    -- events never fire.
     local area = script.object
     if not area then return end
     area:AddCursorEventListener(Enum.CursorEventType.CursorClick, onClick)
 end
 
 function OnDestroy()
-    -- The control is being destroyed (teleport, round end, director cleanup).
-    -- Listeners die with the control; the `hit` flag dies with the script
-    -- instance. The squish TweenSequence in onClick is intentionally NOT
-    -- killed: it completes in 0.18s (its OnComplete checks script.alive so
-    -- it won't double-destroy). Killing mid-squish would freeze the corpse
-    -- at half-squish.
+    -- Listeners and the `hit` flag die with the script instance. The squish
+    -- sequence is intentionally not killed: it completes in 0.18s and its
+    -- OnComplete is script.alive-guarded.
 end

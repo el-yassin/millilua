@@ -1,23 +1,19 @@
 -------------------------------------------------------------------------------
--- pause_menu.lua — the pause overlay (exercise 3).
+-- pause_menu.lua — the pause overlay (a pure VIEW).
 --
--- ATTACHED TO: the "PauseMenu" Container Control (sibling of PlayArea/Hud/
--- Results under the root). The director invokes Show/Hide/ForceClose.
--- ALL pause STATE lives in the director — this script is pure presentation.
--- One owner per piece of state!
+-- ATTACHED TO: the "PauseMenu" Container Control (child of the root, drawn
+-- over the Game screen). The director invokes Show/Hide/ForceClose.
 --
--- WHY THE PAUSE KEY ISN'T HERE: the toggle lives on the always-active root
--- control in director.lua; this panel only draws and offers buttons.
+-- ALL pause STATE lives in the director, and ALL input (Resume/Restart/Quit,
+-- Tab to resume, gamepad back) lives in game_flow.lua — like every other
+-- screen. This script only draws: dim overlay + centered menu.
 --
--- VISIBILITY vs ACTIVE: same rule as results_panel — this panel stays
--- ACTIVE for the whole stage and hides with SetVisible(false), so its
--- OnStart has always run by the time Show is first invoked, and its key
--- listeners stay registered.
+-- VISIBILITY vs ACTIVE: same rule as results_panel — this panel stays ACTIVE
+-- for the whole stage and hides with SetVisible(false), so its OnStart has
+-- always run by the time Show is first invoked.
 --
 -- PATTERN TOUR:
 --   [SCREENS]       dim overlay + centered menu, fade/pop in
---   [CONTROLLER]    focus moves to Resume on show
---   [KEY EVENTS]    confirm + back listeners, boolean = consumed
 --   [INVOKABLE API] Show/Hide/ForceClose called cross-script
 --   [TWEEN SET]     self-pruning registry, killed on Hide + OnDestroy
 -------------------------------------------------------------------------------
@@ -42,11 +38,8 @@ local function killTweens()
     tweens = {}
 end
 
-local function director()
-    local root = game.FindClientUIRoot("SmashGarden")
-    local d = root and root:GetScriptByPath("minigame/director")
-    if d and d.alive then return d end
-    return nil
+function IsShown()
+    return shown
 end
 
 function Show()
@@ -66,12 +59,6 @@ function Show()
     trackTween(game.Tween(ui.menu,
         { localScaleX = 1, localScaleY = 1 }, 0.2)
         :SetEase(Enum.EaseType.OutBack)):Play()
-
-    -- Controller users: focus lands on Resume, so the menu is operable
-    -- without ever touching a stick to "find" a button.
-    if game.GetDevice() == Enum.Device.Gamepad then
-        game.SetControllerFocus(ui.resumeButton)
-    end
 end
 
 function Hide()
@@ -84,45 +71,18 @@ function Hide()
 end
 
 -- Director calls this when a round ends while somehow still paused (e.g.
--- AbortRound from the server): no animation, just gone, state forgotten.
+-- the server aborting the round): no animation, just gone, state forgotten.
 function ForceClose()
     Hide()
-end
-
-local function resume()
-    if not shown then return false end
-    local d = director()
-    if d then d:Invoke("OnResumeRequested") end
-    return true
-end
-
-local function quit()
-    if not shown then return false end
-    local d = director()
-    if d then d:Invoke("OnQuitRequested") end
-    return true
 end
 
 function OnStart()
     ui.panel = script.object
     ui.overlay = ui.panel:GetChild("Overlay")     -- full-screen dim image
     ui.menu = ui.panel:GetChild("MenuBox")        -- centered container
-    ui.resumeButton = ui.menu:GetChild("ResumeButton")
-    ui.quitButton = ui.menu:GetChild("QuitButton")
 
-    -- Register BOTH keyboard and controller variants on each button —
-    -- the controller-parity pattern. The boolean return matters: true =
-    -- handled (stops the chain), false = let other listeners try.
-    ui.resumeButton:AddKeyEventListener(Enum.KeyEventType.KeyboardInteractKeyUp, resume)
-    ui.resumeButton:AddKeyEventListener(Enum.KeyEventType.ControllerJumpKeyUp, resume)
-    ui.quitButton:AddKeyEventListener(Enum.KeyEventType.KeyboardDropKeyUp, quit)
-    ui.quitButton:AddKeyEventListener(Enum.KeyEventType.ControllerInteractKeyUp, quit)
-
-    -- The overlay itself isn't a button, but the pause key should still
-    -- resume when focus isn't on a specific button: listen on the panel too.
-    ui.panel:AddKeyEventListener(Enum.KeyEventType.KeyboardOpenShortcutWheelKeyUp, resume)
-    ui.panel:AddKeyEventListener(Enum.KeyEventType.ControllerMenuBackKeyUp, resume)
-
+    -- Buttons (ResumeButton / RestartButton / QuitButton) are wired by
+    -- game_flow.lua — this view script never registers input listeners.
     Hide() -- always start hidden; director owns Show
 end
 

@@ -1,101 +1,129 @@
 -------------------------------------------------------------------------------
--- director.lua — the game director ("state machine") of the minigame.
+-- director.lua — the in-round game director (state machine + scoring).
 --
 -- ATTACHED TO: the root Client Container Control, named "SmashGarden".
 --
 -- Why the director lives on the root control and NOT in a Global Script:
 -- a Global Script has `script.object == nil` and no way to reach into the
--- UI hierarchy. The director needs to find/spawn/destroy controls, so it
--- hangs off the root and uses game.FindClientUIRoot + FindChild + GetChild.
--- Everything else in the minigame talks to the director via script:Invoke.
+-- UI hierarchy. Everything else in the game talks to it via script:Invoke.
 --
--- PATTERN TOUR (search for these keywords while reverse-engineering):
---   [STATE MACHINE]   round state + EnableUpdate gating
---   [COUNTDOWN]       3..2..1..GO driven by OnUpdate real-time (exercise 2)
---   [PAUSE]           OnLevelUpdate-driven timer + PauseLevelTime (exercise 3)
---   [GOLDEN TARGET]   second template, self-reported multiplier (exercise 4)
---   [TIMER COLOR]     imageColor tween when time runs low (exercise 5)
---   [SERVER TUNING]   golden rate changed live from a node graph (exercise 6)
---   [I18N]            GetLanguageType-aware formatting (exercise 7)
---   [SIGNAL IN/OUT]   RegisterServerSignalHandler / game.ServerSignal
---   [CUSTOM VAR]      high score persisted via Custom Variables
---   [POOLING]         Instantiate/destroy targets + score popups
---   [CLEANUP]         OnDestroy kills every tween it created
+-- The director owns exactly one thing: A RUN. Menus, screens, coins and
+-- progression belong to game_flow.lua / wallet.lua. The director is told
+-- "run level N", reports facts when it ends, and keeps no opinions about
+-- what happens next.
+--
+-- PATTERN TOUR:
+--   [STATE MACHINE]  IDLE -> COUNTDOWN -> PLAYING -> IDLE (EnableUpdate gating)
+--   [COUNTDOWN]      real-time 3..2..1..GO on OnUpdate (ignores level pause)
+--   [ROUND CLOCK]    OnLevelUpdate + PauseLevelTime (pause freezes the clock)
+--   [TARGET KINDS]   5 templates, one script, different `Kind` script vars
+--   [FEVER]          combo threshold -> double points + screen flash + sfx
+--   [SERVER SIGNALS] RoundComplete / SubmitHighScore are sent by wallet.lua
+--   [CLEANUP]        OnDestroy kills every tween/audio it created
 -------------------------------------------------------------------------------
 
----@class StartRound          -- typed signal params for LuaLS (match signal name!)
----@field [1] integer         -- [1] optional round-duration override in seconds
-
--- Script Variables defined in this script's mapping (Script Mapping menu).
--- Read in OnInit, NOT at top level: the mapping is guaranteed loaded by
--- OnInit, whereas top-level code runs before any lifecycle guarantee.
-local ROUND_DURATION = 30
-local TARGET_TEMPLATE_INDEX = nil
-local GOLDEN_TEMPLATE_INDEX = nil
+-- Script Variables (read in OnInit; mapping is guaranteed loaded by then).
+local TEMPLATE = { [1] = nil, [2] = nil, [3] = nil, [4] = nil, [5] = nil }
 local POPUP_TEMPLATE_INDEX = nil
-local HIT_SFX_ID, MISS_SFX_ID, ROUND_END_SFX_ID = 0, 0, 0
--- 1 = the F key starts a round (test play / no node graph yet). Set to 0
--- in a production stage so only the server's StartRound signal can start
--- rounds — the key listener then declines everything.
-local ALLOW_MANUAL_START = 1
+local HIT_SFX_ID, MISS_SFX_ID, BOMB_SFX_ID = 0, 0, 0
+local TIME_SFX_ID, ROUND_END_SFX_ID, FEVER_SFX_ID = 0, 0, 0
 
--- `ui` is declared HERE, before any function that closes over it — in Lua,
--- a local declared AFTER a function body would not be captured; references
--- would silently resolve to a global (nil) and crash at call time.
-local ui = {}        -- { root, playArea, timerBar, scoreText, comboText, ... }
-local bestScore = 0
+-- Target kind codes. Kept in sync with level_data.lua and target.lua.
+local KIND_NORMAL, KIND_SILVER, KIND_GOLDEN, KIND_BOMB, KIND_TIME = 1, 2, 3, 4, 5
 
--- Shared-code pattern: helpers.lua is attached to the same root control;
--- resolve its Script instance and always check .alive before Invoke.
-local function helpers()
-    local root = game.FindClientUIRoot("SmashGarden")
-    local h = root and root:GetScriptByPath("minigame/helpers")
-    if h and h.alive then return h end
-    return nil
-end
-
--- Panel scripts resolved LAZILY, not cached in OnStart: we can't control
--- the order in which sibling controls' OnStart run, but by the time we
--- Invoke on a panel it's certainly initialized. Re-resolve every call —
--- GetScriptByPath is cheap and the .alive check keeps us honest.
-local function panelScript(controlName, scriptPath)
-    local root = ui.root or game.FindClientUIRoot("SmashGarden")
-    if not root then return nil end
-    local control = root:GetChild(controlName)
-    local s = control and control:GetScriptByPath(scriptPath)
-    if s and s.alive then return s end
-    return nil
-end
-
-local function resultsPanel() return panelScript("Results", "minigame/results_panel") end
-local function pauseMenu()    return panelScript("PauseMenu", "minigame/pause_menu") end
-
--- Where the "BestScore" Custom Variable component lives. See
--- Enum.CustomVariableEntityType for the valid entity types and adjust to
--- wherever you placed the Custom Variable component in the editor.
-local HIGHSCORE_ENTITY = Enum.CustomVariableEntityType.Player
-local HIGHSCORE_VAR = "BestScore"
+-- Scoring constants (design data, safe to tune).
+local BOMB_PENALTY = 15
+local TIME_BONUS_SECONDS = 3
+local FEVER_BASE_THRESHOLD = 10
+local FEVER_POINTS_MULTIPLIER = 2
 
 local State = { IDLE = 1, COUNTDOWN = 2, PLAYING = 3 }
 local STATE_NAMES = { [State.IDLE] = "IDLE", [State.COUNTDOWN] = "COUNTDOWN",
                       [State.PLAYING] = "PLAYING" }
 local state = State.IDLE
 
--- Round state
-local score, combo, bestCombo, hits, misses = 0, 0, 0, 0, 0
+-- `ui` is declared before every function that closes over it (Lua lexical
+-- scoping: a local declared later would resolve to a global nil at runtime).
+local ui = {}
+local activeTweens = {}   -- self-pruning registry
+local playingAudio = {}
+
+local currentLevel = 1
+local config = nil        -- level definition fetched from level_data.lua
+local roundDuration = 30
+local feverThreshold = FEVER_BASE_THRESHOLD
+local goldTier = 0
+
+local score, combo, bestCombo, hits, misses, bombs, timeBonuses = 0, 0, 0, 0, 0, 0, 0
+local fever = false
 local timeLeft = 0
-local roundDuration = ROUND_DURATION
 local countdownLeft = 0
 local nextSpawnIn = 0
-local goldenRate = 0.12          -- chance a spawn is golden; server-tunable
 local paused = false
-local timerPulsed = false        -- low-time color flash fired this round?
-local slotOccupied = {}          -- [slotIndex] = true while a target lives there
-local liveTargets = {}           -- [controlId] = { control, slot, expiresAt }
--- Tween registry: a SET (tween -> true), not an array, so finished tweens
--- can prune themselves in their own OnComplete — the registry never grows
--- unbounded across a long session. OnDestroy kills whatever remains.
-local activeTweens = {}          -- every live Tween we created
+local slotOccupied = {}
+local liveTargets = {}
+local kindOverride = 0    -- debug: force the next spawns to one kind (0 = off)
+
+local COLOR_GOLD_POPUP = Color.FromRGB(255, 204, 0)
+local COLOR_BOMB_POPUP = Color.FromRGB(244, 67, 54)
+local COLOR_TIME_POPUP = Color.FromRGB(80, 200, 255)
+
+-------------------------------------------------------------------------------
+-- Cross-script lookups (always lazy + alive-checked)
+-------------------------------------------------------------------------------
+
+local function rootControl()
+    return ui.root or game.FindClientUIRoot("SmashGarden")
+end
+
+-- Resolves a control owned by ANOTHER script: the editor-authored child of the
+-- root with the expected name (the layout is built in the MiliLua editor).
+local function panelControl(controlName)
+    local root = rootControl()
+    return root and root:GetChild(controlName)
+end
+
+local function rootScript(path)
+    local root = rootControl()
+    local s = root and root:GetScriptByPath(path)
+    if s and s.alive then return s end
+    return nil
+end
+
+local function panelScript(controlName, path)
+    local c = panelControl(controlName)
+    local s = c and c:GetScriptByPath(path)
+    if s and s.alive then return s end
+    return nil
+end
+
+local function levelData()  return rootScript("minigame/level_data") end
+local function wallet()     return rootScript("minigame/wallet") end
+local function flow()       return rootScript("minigame/game_flow") end
+local function hud()        return ui.hud and ui.hud:GetScriptByPath("minigame/hud") end
+local function resultsPanel() return panelScript("Results", "minigame/results_panel") end
+local function pauseMenu()    return panelScript("PauseMenu", "minigame/pause_menu") end
+
+-- Localized text with the embedded English fallback (see helpers.Text).
+local function txt(key, a, b, c)
+    local h = rootScript("minigame/helpers")
+    return h and h:Invoke("Text", key, a, b, c) or key
+end
+
+-------------------------------------------------------------------------------
+-- Small utilities
+-------------------------------------------------------------------------------
+
+local function mustFind(parent, name)
+    if not parent then return nil end
+    local c = parent:GetChild(name)
+    if not c then
+        printerr("[director] missing control: " .. name ..
+                 " (parent=" .. tostring(parent.name) .. ")")
+    end
+    return c
+end
+
 local function addTween(t)
     activeTweens[t] = true
     return t
@@ -103,39 +131,13 @@ end
 local function trackTween(t, onComplete)
     activeTweens[t] = true
     return t:SetOnComplete(function()
-        activeTweens[t] = nil -- self-prune: this tween is done
+        activeTweens[t] = nil
         if onComplete then onComplete() end
     end)
 end
-local playingAudio = {}          -- audio instance ids, so we can StopAudio cleanly
-
--- Colors for the timer bar (exercise 5). Color.FromRGB is documented on the
--- Color global; ColorValues are immutable value objects.
-local COLOR_TIMER_OK = Color.FromRGB(76, 175, 80)
-local COLOR_TIMER_LOW = Color.FromRGB(244, 67, 54)
-local COLOR_GOLD_POPUP = Color.FromRGB(255, 204, 0)
-
--- Combo text font sizes: base value and the "pop" value the change-tween
--- overshoots to. Named because both are written in three places below.
-local COMBO_FONT_BASE, COMBO_FONT_POP = 26, 36
-local comboPopTween = nil -- current pop tween; killed before retriggering
-
--------------------------------------------------------------------------------
--- Helpers
--------------------------------------------------------------------------------
-
--- Find a child or fail loudly. printerr is your best friend in test play.
-local function mustFind(parent, name)
-    local c = parent:GetChild(name)
-    if not c then
-        printerr("[SmashGarden] missing control: " .. name ..
-                 " (parent=" .. tostring(parent and parent.name) .. ")")
-    end
-    return c
-end
 
 local function playSfx(id)
-    if id > 0 then
+    if id and id > 0 then
         local audioId = game.PlayAudio2D(id)
         playingAudio[audioId] = true
         return audioId
@@ -143,80 +145,74 @@ local function playSfx(id)
     return nil
 end
 
--------------------------------------------------------------------------------
--- Localized text (never hardcode strings; game.GetText falls back to the
--- source language when a translation is missing).
--------------------------------------------------------------------------------
-local function fmtScore(n)   return string.format(game.GetText("minigame.score"), n) end
-local function fmtCombo(c)   return string.format(game.GetText("minigame.combo"), c) end
+local function clamp(v, lo, hi)
+    return math.max(lo, math.min(hi, v))
+end
 
--- [I18N] Exercise 7: some languages read better with different separators.
--- game.GetLanguageType() returns an EnumItem.LanguageType — branch on it
--- for formatting quirks, but keep ALL visible strings in Text Mapping.
-local function comboSeparator()
-    local lang = game.GetLanguageType()
-    if lang == Enum.LanguageType.Japanese then return "／" end
-    return " · "
+local function refreshHudScore()
+    local h = hud()
+    if h then h:Invoke("SetScore", score) end
+end
+
+local function refreshHudCombo()
+    local h = hud()
+    if not h then return end
+    local hp = rootScript("minigame/helpers")
+    local mult = hp and hp:Invoke("GetMultiplier", combo) or 1
+    h:Invoke("SetCombo", combo, mult, fever)
+end
+
+local function refreshHudAll()
+    refreshHudScore()
+    refreshHudCombo()
 end
 
 -------------------------------------------------------------------------------
--- UI refresh
+-- Score popups
 -------------------------------------------------------------------------------
-local function refreshHud()
-    if ui.scoreText then ui.scoreText.text = fmtScore(score) end
-    if ui.comboText then
-        local h = helpers()
-        local mult = h and h:Invoke("GetMultiplier", combo) or 1
-        ui.comboText.text = fmtCombo(combo) .. comboSeparator() .. "x" .. mult
 
-        -- Combo text pops when it changes (tweenable field!). Kill the
-        -- previous pop FIRST: tweened fields are LOCKED while a Tween plays,
-        -- so an overlapping pop would warn and fight over fontSize. After a
-        -- kill the field is free again — snap it to base before re-popping.
-        if comboPopTween then
-            comboPopTween:Kill(false)
-            comboPopTween = nil
-            if ui.comboText.alive then ui.comboText.fontSize = COMBO_FONT_BASE end
-        end
-        comboPopTween = trackTween(
-            game.Tween(ui.comboText, { fontSize = COMBO_FONT_POP }, 0.15),
-            function()
-                -- Track the return tween in the SAME reference: it holds
-                -- the fontSize lock, and an untracked leftover would fight
-                -- the next pop over the locked field.
-                if ui.comboText and ui.comboText.alive then
-                    comboPopTween = addTween(
-                        game.Tween(ui.comboText, { fontSize = COMBO_FONT_BASE }, 0.15):Play())
-                else
-                    comboPopTween = nil
-                end
-            end):Play()
-    end
-end
-
--------------------------------------------------------------------------------
--- Score popups: spawn a floating "+20" at a position, tween it up, destroy it.
--- This is the instantiate -> animate -> destroy pattern in miniature.
--------------------------------------------------------------------------------
 local function spawnPopup(x, y, text, color)
     if not POPUP_TEMPLATE_INDEX then return end
     local popup = game.InstantiateClientUIControl(POPUP_TEMPLATE_INDEX, ui.playArea)
     popup.text = text
     popup:SetAnchoredPosition(x, y)
-    popup:SetAsLastSibling() -- higher sibling index renders on top
+    popup:SetAsLastSibling()
     if color then popup.fontColor = color end
-    -- trackTween: prunes itself from the registry on completion, and the
-    -- callback destroys the popup — nothing accumulates.
     trackTween(game.Tween(popup, { anchoredPositionY = y + 80, fontSize = 48 }, 0.6)
         :SetEase(Enum.EaseType.OutCubic), function()
-            game.DestroyClientUIControl(popup) -- popups are disposable
+            if popup.alive then game.DestroyClientUIControl(popup) end
         end):Play()
 end
 
 -------------------------------------------------------------------------------
--- Targets: spawn into a free slot, pop in; director owns their lifetime.
+-- Level configuration
 -------------------------------------------------------------------------------
-local MAX_ACTIVE = 3
+
+local function fetchConfig(levelId)
+    local ld = levelData()
+    if not ld then
+        printerr("[director] level_data script is missing — cannot start a level")
+        return nil
+    end
+    local c = {
+        duration   = ld:Invoke("GetDuration", levelId),
+        target     = ld:Invoke("GetTarget", levelId),
+        silver     = ld:Invoke("GetSilver", levelId),
+        gold       = ld:Invoke("GetGold", levelId),
+        spawnStart = ld:Invoke("GetSpawnStart", levelId),
+        spawnMin   = ld:Invoke("GetSpawnMin", levelId),
+        maxActive  = ld:Invoke("GetMaxActive", levelId),
+        weights    = {},
+    }
+    for code = 1, 5 do
+        c.weights[code] = ld:Invoke("GetWeight", levelId, code)
+    end
+    return c
+end
+
+-------------------------------------------------------------------------------
+-- Targets
+-------------------------------------------------------------------------------
 
 local function anyFreeSlot()
     local free = {}
@@ -227,75 +223,92 @@ local function anyFreeSlot()
     return free[math.random(#free)]
 end
 
-local function spawnTarget()
-    -- [GOLDEN TARGET] (exercise 4) roll the dice: golden targets use their
-    -- own template (prettier art) with a higher PointsMultiplier script var.
-    local isGolden = GOLDEN_TEMPLATE_INDEX ~= nil and math.random() < goldenRate
-    local templateIndex = isGolden and GOLDEN_TEMPLATE_INDEX or TARGET_TEMPLATE_INDEX
+local function pickKind()
+    if kindOverride ~= 0 then return kindOverride end
+    local roll = math.random(1, 100)
+    local acc = 0
+    for code = 1, 5 do
+        acc = acc + (config.weights[code] or 0)
+        if roll <= acc then return code end
+    end
+    return KIND_NORMAL
+end
+
+local function lifetimeFor(kind)
+    local progress = 1 - (timeLeft / roundDuration)
+    local base = math.max(0.6, 1.6 - progress * 0.9)
+    if kind == KIND_GOLDEN then return base * 0.55 end
+    if kind == KIND_BOMB then return base * 1.35 end
+    if kind == KIND_TIME then return base * 1.10 end
+    return base
+end
+
+local function spawnTarget(forcedKind)
+    local kind = forcedKind or pickKind()
+    local templateIndex = TEMPLATE[kind]
     if not templateIndex then
-        printerr("[SmashGarden] TargetTemplateIndex script variable not set!")
-        return
+        printerr("[director] missing TargetTemplate script variable for kind " .. tostring(kind))
+        return nil
     end
     local slot = anyFreeSlot()
-    if not slot then return end
+    if not slot then return nil end
 
     local control = game.InstantiateClientUIControl(templateIndex, ui.slots[slot])
     control:SetAnchoredPosition(0, 0)
-    control:SetLocalScale(0, 0, 1) -- start invisible, pop in
+    control:SetLocalScale(0, 0, 1)
     slotOccupied[slot] = true
 
-    -- Pop-in bounce. EaseLab (linked from the Tween docs) visualizes eases.
-    -- Golden targets pop bigger to telegraph their value. The tween is
-    -- STORED in the live entry: if the target gets clicked or expires while
-    -- still popping in, we must kill it before tweening scale again
-    -- (tweened fields are LOCKED while a Tween plays).
-    local popScale = isGolden and 1.25 or 1
+    local popScale = (kind == KIND_GOLDEN) and 1.25 or 1
     local popTween = game.Tween(control,
         { localScaleX = popScale, localScaleY = popScale }, 0.18)
         :SetEase(Enum.EaseType.OutBack)
     addTween(popTween:Play())
 
-    -- Golden targets are greedier: shorter lifetime.
-    local baseLifetime = math.max(0.6, 1.6 - (1 - timeLeft / roundDuration) * 0.9)
-    local lifetime = isGolden and baseLifetime * 0.55 or baseLifetime
-    liveTargets[control.id] = { control = control, slot = slot,
-                                expiresAt = timeLeft - lifetime,
-                                golden = isGolden, popTween = popTween }
-    -- NOTE: expiresAt counts DOWN with timeLeft; see OnLevelUpdate.
+    liveTargets[control.id] = {
+        control = control,
+        slot = slot,
+        kind = kind,
+        expiresAt = timeLeft - lifetimeFor(kind),
+        popTween = popTween,
+    }
+    return control
 end
 
--- despawn: pop out and destroy. Safe to call twice — the live-list removal
--- below is the idempotence guard (a despawned id can't be found again).
 local function despawnTarget(id)
     local t = liveTargets[id]
     if not t or not t.control or not t.control.alive then return end
     liveTargets[id] = nil
     slotOccupied[t.slot] = nil
 
-    -- Kill the pop-in tween first (force-complete so the target despawns
-    -- from full size, not from mid-pop): a second tween on the same scale
-    -- fields would hit the tween lock. The pop-in has no OnComplete, so
-    -- force-completing is side-effect free.
+    -- Kill the pop-in first (force-complete: despawn from full size).
     if t.popTween then
         t.popTween:Kill(true)
         t.popTween = nil
     end
 
     local c = t.control
-    c.raycastTarget = false -- stop it eating clicks while it shrinks
+    c.raycastTarget = false
     trackTween(game.Tween(c, { localScaleX = 0, localScaleY = 0 }, 0.12)
         :SetEase(Enum.EaseType.InBack), function()
-            game.DestroyClientUIControl(c)
+            if c.alive then game.DestroyClientUIControl(c) end
         end):Play()
+end
+
+local function resetCombo()
+    combo = 0
+    if fever then
+        fever = false
+    end
 end
 
 local function expireTargets()
     for id, t in pairs(liveTargets) do
         if timeLeft <= t.expiresAt then
             despawnTarget(id)
-            -- A target escaping resets the combo: rewards speed.
-            combo = 0
-            refreshHud()
+            -- An escaped target breaks the combo and counts as a miss.
+            resetCombo()
+            misses = misses + 1
+            refreshHudAll()
         end
     end
 end
@@ -303,45 +316,13 @@ end
 -------------------------------------------------------------------------------
 -- Round lifecycle
 -------------------------------------------------------------------------------
-local function showResults()
-    playSfx(ROUND_END_SFX_ID)
 
-    -- Persist high score via Custom Variables (server-side state!).
-    if score > bestScore then
-        bestScore = score
-        -- Writing goes through the server: see README "Custom Variables"
-        -- section — the node graph owns the variable, we report to it.
-        local sig = game.ServerSignal("SubmitHighScore")
-        sig:AddInt(score)
-        sig:SendSignal()
-    end
-
-    local results = resultsPanel()
-    if results then
-        -- Results panel knows how to animate itself in; we just hand it data.
-        results:Invoke("Show", score, hits, misses, bestCombo, bestScore)
-    end
-
-    -- Report the round to node graphs (rewards, unlocks, analytics...).
-    -- [SERVER-DRIVEN] (exercise 6): the node graph listens for this to
-    -- unlock the next stage — see README "Node graph wiring".
-    local sig = game.ServerSignal("RoundComplete")
-    sig:AddInt(score)
-    sig:AddInt(hits)
-    sig:AddInt(misses)
-    sig:AddInt(bestCombo)
-    sig:SendSignal()
-end
-
--- [COUNTDOWN] (exercise 2) 3..2..1..GO, then the round. Runs on OnUpdate
--- (real time) — NOT OnLevelUpdate — so the countdown ignores level-time
--- pausing; a paused game can't have a half-paused countdown.
 local function beginCountdown()
     state = State.COUNTDOWN
     countdownLeft = 3.2
-    ui.playArea:SetActive(true)
-    ui.hud:SetActive(true)
-    if ui.countdownText then ui.countdownText:SetActive(true) end
+    ui.playArea:SetVisible(false) -- no clicking through the countdown
+    ui.hud:SetVisible(true)
+    if ui.countdownText then ui.countdownText:SetVisible(true) end
     script:EnableUpdate(true)
 end
 
@@ -349,100 +330,111 @@ local function tickCountdown(dt)
     local previous = math.ceil(countdownLeft)
     countdownLeft = countdownLeft - dt
     local current = math.ceil(countdownLeft)
-    local cd = ui.countdownText -- may be nil (mustFind already logged it)
+    local cd = ui.countdownText
 
     local text
     if countdownLeft > 1 then
-        text = string.format(game.GetText("minigame.countdown"), current)
+        text = txt("minigame.countdown", current)
     elseif countdownLeft > 0 then
-        text = game.GetText("minigame.go")
+        text = txt("minigame.go")
     else
-        if cd then cd:SetActive(false) end
+        if cd then cd:SetVisible(false) end
         state = State.PLAYING
+        ui.playArea:SetVisible(true)
         timeLeft = roundDuration
-        nextSpawnIn = 0.4
-        print(string.format("[SmashGarden] round started (%.0fs)", timeLeft))
+        nextSpawnIn = 0.35
+        print(string.format("[director] level %d started (%.0fs)", currentLevel, timeLeft))
         return
     end
 
     if cd and text and current ~= previous then
         cd.text = text
-        -- Punch the number in: big -> normal. Two chained tweens.
         cd:SetLocalScale(1.6, 1.6, 1)
         addTween(game.Tween(cd, { localScaleX = 1, localScaleY = 1 }, 0.25)
-            :SetEase(Enum.EaseType.OutBack)
-            :Play())
+            :SetEase(Enum.EaseType.OutBack):Play())
     end
 end
 
-local function startRound(durationOverride)
-    if state ~= State.IDLE then return end
+local function stopRound(report)
+    if paused then
+        paused = false
+        game.PauseLevelTime(false)
+        if pauseMenu() then pauseMenu():Invoke("ForceClose") end
+        local f = flow()
+        if f then f:Invoke("OnPauseChanged", false) end
+    end
+    state = State.IDLE
+    script:EnableUpdate(false)
 
-    score, combo, bestCombo, hits, misses = 0, 0, 0, 0, 0
-    -- Clamp the server-provided duration: a bad node graph payload must
-    -- not be able to produce a zero/negative round (division by zero in
-    -- the timer bar and spawn ramp below).
-    roundDuration = math.max(5, math.min(300,
-        tonumber(durationOverride) or ROUND_DURATION))
-    slotOccupied, liveTargets = {}, {}
+    for id in pairs(liveTargets) do despawnTarget(id) end
+    ui.hud:SetVisible(false)
+    ui.playArea:SetVisible(false)
+    if ui.countdownText then ui.countdownText:SetVisible(false) end
+    playSfx(ROUND_END_SFX_ID)
+
+    if report then
+        local hp = rootScript("minigame/helpers")
+        local stars = hp and hp:Invoke("StarsFor", score,
+            config.target, config.silver, config.gold) or 0
+        local f = flow()
+        if f then
+            f:Invoke("OnRoundFinished", currentLevel, score, hits, misses, bestCombo, stars)
+        end
+    end
+end
+
+local function startLevel(levelId)
+    if state ~= State.IDLE then return false end
+
+    currentLevel = clamp(tonumber(levelId) or 1, 1, 99)
+    config = fetchConfig(currentLevel)
+    if not config then return false end
+
+    -- Shop upgrades are read once per round: menus cannot open mid-round.
+    local w = wallet()
+    local timeTier = w and w:Invoke("GetUpgrade", "time") or 0
+    goldTier = w and w:Invoke("GetUpgrade", "gold") or 0
+    local comboTier = w and w:Invoke("GetUpgrade", "combo") or 0
+
+    local hp = rootScript("minigame/helpers")
+    roundDuration = hp and hp:Invoke("AdjustedDuration", config.duration, timeTier) or config.duration
+    feverThreshold = hp and hp:Invoke("FeverThreshold", FEVER_BASE_THRESHOLD, comboTier)
+                     or FEVER_BASE_THRESHOLD
+
+    score, combo, bestCombo, hits, misses, bombs, timeBonuses = 0, 0, 0, 0, 0, 0, 0
+    fever = false
     paused = false
-    timerPulsed = false
-
-    -- The tween registry grows by ~2 entries per target and never shrinks;
-    -- reset it at the round boundary (NOT kill — leftover pop/despawn
-    -- tweens from the previous round self-complete and self-destroy).
+    kindOverride = 0
+    slotOccupied, liveTargets = {}, {}
     activeTweens = {}
-    -- The combo pop is the exception: the registry forgot it, so kill it
-    -- explicitly or the first refreshHud of the new round hits its lock.
-    if comboPopTween then
-        comboPopTween:Kill(false)
-        comboPopTween = nil
-    end
 
-    -- Restore the timer bar's calm color for the new round (direct set:
-    -- no tween is running on it between rounds, so the field isn't locked).
-    if ui.timerBar then
-        ui.timerBar.imageColor = COLOR_TIMER_OK
-    end
+    local h = hud()
+    if h then h:Invoke("Reset", currentLevel, config.target) end
 
     local results = resultsPanel()
     if results then results:Invoke("Hide") end
     local pause = pauseMenu()
     if pause then pause:Invoke("ForceClose") end
+
     beginCountdown()
-    refreshHud()
+    print(string.format("[director] StartLevel %d (duration=%.0fs, target=%d)",
+        currentLevel, roundDuration, config.target))
+    return true
 end
 
-local function endRound()
-    -- Normalize pause first: AbortRound from the server can end a round
-    -- while paused, and leaving level time frozen would break the next
-    -- stage. One owner (this function) guarantees the unfreeze.
-    if paused then
-        paused = false
-        game.PauseLevelTime(false)
-        if pauseMenu() then pauseMenu():Invoke("ForceClose") end
-    end
-    state = State.IDLE
-    script:EnableUpdate(false) -- idle: OnUpdate/OnLevelUpdate stop being called
+-------------------------------------------------------------------------------
+-- Pause
+-------------------------------------------------------------------------------
 
-    for id in pairs(liveTargets) do despawnTarget(id) end
-    ui.hud:SetActive(false)
-    ui.playArea:SetActive(false) -- back to the IDLE baseline (no stray clicks)
-    if ui.countdownText then ui.countdownText:SetActive(false) end
-    playSfx(ROUND_END_SFX_ID)
-    showResults()
-end
-
--- [PAUSE] (exercise 3) game.PauseLevelTime halts LEVEL time: OnLevelUpdate
--- stops firing entirely while paused. The round clock lives in
--- OnLevelUpdate, so pausing freezes it for free — no `if paused` guards
--- in the timer. (Single-player stages only; see PauseLevelTime docs.)
 local function setPaused(p)
-    if state ~= State.PLAYING then return end -- pause only exists mid-round
+    if state ~= State.PLAYING then return end
+    if paused == p then return end
     paused = p
     game.PauseLevelTime(p)
     if pauseMenu() then pauseMenu():Invoke(p and "Show" or "Hide") end
-    print("[SmashGarden] " .. (p and "paused" or "resumed"))
+    local f = flow()
+    if f then f:Invoke("OnPauseChanged", p) end
+    print("[director] " .. (p and "paused" or "resumed"))
 end
 
 -------------------------------------------------------------------------------
@@ -450,196 +442,123 @@ end
 -------------------------------------------------------------------------------
 
 function OnInit()
-    -- Script Variables are guaranteed readable here (mapping is loaded
-    -- before the lifecycle starts). Values validate early, fail LOUDLY,
-    -- and once — instead of silently misbehaving on every spawn.
-    ROUND_DURATION = tonumber(script:GetParam("RoundDuration")) or 30
-    TARGET_TEMPLATE_INDEX = script:GetParam("TargetTemplateIndex")
-    GOLDEN_TEMPLATE_INDEX = script:GetParam("GoldenTemplateIndex")
+    TEMPLATE[KIND_NORMAL] = script:GetParam("TemplateNormal")
+    TEMPLATE[KIND_SILVER] = script:GetParam("TemplateSilver")
+    TEMPLATE[KIND_GOLDEN] = script:GetParam("TemplateGolden")
+    TEMPLATE[KIND_BOMB]   = script:GetParam("TemplateBomb")
+    TEMPLATE[KIND_TIME]   = script:GetParam("TemplateTime")
     POPUP_TEMPLATE_INDEX = script:GetParam("PopupTemplateIndex")
+
     HIT_SFX_ID = tonumber(script:GetParam("HitSfxId")) or 0
     MISS_SFX_ID = tonumber(script:GetParam("MissSfxId")) or 0
+    BOMB_SFX_ID = tonumber(script:GetParam("BombSfxId")) or 0
+    TIME_SFX_ID = tonumber(script:GetParam("TimeSfxId")) or 0
     ROUND_END_SFX_ID = tonumber(script:GetParam("RoundEndSfxId")) or 0
-    ALLOW_MANUAL_START = tonumber(script:GetParam("AllowManualStart")) or 1
-    roundDuration = ROUND_DURATION
+    FEVER_SFX_ID = tonumber(script:GetParam("FeverSfxId")) or 0
 
-    if not TARGET_TEMPLATE_INDEX then
-        printerr("[SmashGarden] TargetTemplateIndex script variable not set — spawns will fail!")
+    if not TEMPLATE[KIND_NORMAL] then
+        printerr("[director] TemplateNormal script variable not set — spawns will fail!")
     end
-    print("[SmashGarden] OnInit — round=" .. tostring(ROUND_DURATION) .. "s")
 end
 
 function OnStart()
-    -- UI controls only exist from OnStart on. Rebuild ALL cached refs here;
-    -- after any loading screen OnStart runs again on the recreated controls.
     local root = game.FindClientUIRoot("SmashGarden")
     if not root then
-        printerr("[SmashGarden] root control 'SmashGarden' not found")
+        printerr("[director] root control 'SmashGarden' not found")
         return
     end
-
     ui.root = root
-    ui.playArea = mustFind(root, "PlayArea")
-    ui.hud = mustFind(root, "Hud")
-    ui.timerBar = mustFind(ui.hud, "TimerBar")
-    ui.scoreText = mustFind(ui.hud, "ScoreText")
-    ui.comboText = mustFind(ui.hud, "ComboText")
-    ui.countdownText = mustFind(root, "CountdownText")
+    ui.game = mustFind(root, "Game")
+    ui.playArea = mustFind(ui.game, "PlayArea")
+    ui.hud = mustFind(ui.game, "Hud")
+    ui.countdownText = mustFind(ui.game, "CountdownText")
     ui.slots = {}
     for i = 1, 9 do
         ui.slots[i] = mustFind(ui.playArea, "Slot" .. i)
     end
 
-    -- NOTE: no eager panel-script caching here on purpose. Sibling OnStart
-    -- order is unspecified; panelScript() resolves lazily at each call site.
-
-    -- Miss detection: clicking empty space in the play area breaks the combo.
-    -- Targets sit ABOVE this area and raycast first, so their clicks don't
-    -- fall through here (see README "Raycast order" note).
+    -- Clicking empty space is a miss: breaks the combo, breaks fever.
     ui.playArea:AddCursorEventListener(Enum.CursorEventType.CursorClick, function(_)
-        if state == State.PLAYING and combo > 0 then
-            combo = 0
-            misses = misses + 1 -- empty clicks count as misses in the stats
+        if state == State.PLAYING and not paused then
+            resetCombo()
+            misses = misses + 1
             playSfx(MISS_SFX_ID)
-            refreshHud()
+            refreshHudAll()
         end
     end)
 
-    -- [SIGNAL IN] Server -> client. Remember: ~100ms minimum latency, and
-    -- params arrive as an indexable table matching the Server Signal Explorer.
-    script:RegisterServerSignalHandler("StartRound", function(_, params)
-        startRound(params and params[1])
-    end)
-    script:RegisterServerSignalHandler("AbortRound", function()
-        if state == State.PLAYING then endRound() end
-    end)
-    -- [SERVER TUNING] (exercise 6) a node graph timer can crank difficulty
-    -- mid-stage: params[1] = golden rate as a 0-100 integer.
-    script:RegisterServerSignalHandler("SetGoldenRate", function(_, params)
-        if params and params[1] then
-            goldenRate = math.min(100, math.max(0, params[1])) / 100
-            print(string.format("[SmashGarden] golden rate -> %d%%", goldenRate * 100))
-        end
-    end)
-
-    -- [CUSTOM VAR] Seed + watch the high score.
-    bestScore = tonumber(game.GetGlobalCustomVariableValue(HIGHSCORE_ENTITY, HIGHSCORE_VAR)) or 0
-    script:RegisterCustomVariableChangedHandler(HIGHSCORE_ENTITY, HIGHSCORE_VAR, function(_, varName)
-        bestScore = tonumber(game.GetGlobalCustomVariableValue(HIGHSCORE_ENTITY, varName)) or bestScore
-        if ui.scoreText then ui.scoreText.text = fmtScore(score) end
-    end)
-
-    ui.hud:SetActive(false)
-    ui.playArea:SetActive(false)
-    if ui.countdownText then ui.countdownText:SetActive(false) end
-
-    -- Test-play + keyboard convenience: F starts a round with no node graph,
-    -- ESC toggles pause. Key listeners on the ROOT control — it's active in
-    -- every state (IDLE, countdown, playing, results), which is exactly the
-    -- "always listening" scope we want. Callbacks return a boolean: true =
-    -- event handled (stops the chain), false = let others have it.
-    ui.root:AddKeyEventListener(Enum.KeyEventType.KeyboardInteractKeyUp, function()
-        if ALLOW_MANUAL_START ~= 1 then return false end -- server-only start
-        if state == State.IDLE then
-            startRound()
-            return true
-        end
-        return false
-    end)
+    -- Pause key: only OPENS the pause menu. Closing belongs to game_flow (so
+    -- a paused game has exactly one handler for Tab/back and no double toggle).
     ui.root:AddKeyEventListener(Enum.KeyEventType.KeyboardOpenShortcutWheelKeyUp, function()
-        if state == State.PLAYING then
-            setPaused(not paused)
+        if state == State.PLAYING and not paused then
+            setPaused(true)
             return true
         end
         return false
     end)
-    -- Controller parity: same pause toggle on the menu-back button.
     ui.root:AddKeyEventListener(Enum.KeyEventType.ControllerMenuBackKeyUp, function()
-        if state == State.PLAYING then
-            setPaused(not paused)
+        if state == State.PLAYING and not paused then
+            setPaused(true)
             return true
         end
         return false
     end)
 
-    print("[SmashGarden] ready. Press F (or send the StartRound signal).")
+    -- Start hidden; game_flow shows the Game screen when a level starts.
+    ui.hud:SetVisible(false)
+    ui.playArea:SetVisible(false)
+    if ui.countdownText then ui.countdownText:SetVisible(false) end
+    print("[director] ready")
 end
 
--- [TIME] The whole game clock. deltaTime makes it frame-rate independent.
--- Countdown ticks on REAL time (OnUpdate)...
-function OnUpdate(deltaTime)
+-- Countdown uses REAL time (no half-paused countdowns).
+function OnUpdate(dt)
     if state == State.COUNTDOWN then
-        tickCountdown(deltaTime)
+        tickCountdown(dt)
     end
 end
 
--- ...while the round ticks on LEVEL time (OnLevelUpdate), which
--- game.PauseLevelTime can suspend. That split IS the pause feature.
-function OnLevelUpdate(deltaTime)
+-- The round clock uses LEVEL time: PauseLevelTime suspends OnLevelUpdate,
+-- which freezes the clock, spawning and expiry for free.
+function OnLevelUpdate(dt)
     if state ~= State.PLAYING or paused then return end
 
-    timeLeft = timeLeft - deltaTime
+    timeLeft = timeLeft - dt
     if timeLeft <= 0 then
         timeLeft = 0
-        endRound()
+        stopRound(true)
         return
     end
 
-    -- Timer bar: set fillAmount directly per frame. It's [Tweenable], but a
-    -- tween would fight per-frame writes — tweened fields are LOCKED while
-    -- a Tween plays. Use tweens for one-shot flourishes (see color pulse),
-    -- direct sets for continuous, value-driven updates like this.
-    if ui.timerBar then
-        ui.timerBar:SetFillHorizontal(Enum.ImageFillHorizontalType.LeftToRight,
-                                      timeLeft / roundDuration)
-    end
+    local h = hud()
+    if h then h:Invoke("SetTimer", timeLeft / roundDuration) end
 
-    -- [TIMER COLOR] (exercise 5) under 25%: flash the bar red once. One-shot
-    -- tweens are fine here — the color is a flourish, not the driving value.
-    -- The local flag prevents re-triggering every frame (and tween-lock
-    -- errors on an already-tweened field).
-    if ui.timerBar and timeLeft < roundDuration * 0.25 and not timerPulsed then
-        timerPulsed = true
-        addTween(game.Tween(ui.timerBar, { imageColor = COLOR_TIMER_LOW }, 0.3)
-            :SetEase(Enum.EaseType.InOutSine)
-            :Play())
-    end
-
-    -- Spawn pressure ramps up as the round drains.
-    nextSpawnIn = nextSpawnIn - deltaTime
+    nextSpawnIn = nextSpawnIn - dt
     if nextSpawnIn <= 0 then
         local aliveCount = 0
         for _ in pairs(liveTargets) do aliveCount = aliveCount + 1 end
-        if aliveCount < MAX_ACTIVE then spawnTarget() end
+        if aliveCount < config.maxActive then spawnTarget() end
         local progress = 1 - timeLeft / roundDuration
-        nextSpawnIn = math.max(0.25, 0.9 - progress * 0.6)
+        nextSpawnIn = math.max(config.spawnMin,
+            config.spawnStart - progress * (config.spawnStart - config.spawnMin))
     end
 
     expireTargets()
 end
 
 -------------------------------------------------------------------------------
--- Entry points for other scripts (called via script:Invoke).
+-- Invokable API (called by target.lua, game_flow.lua, debug_hud.lua)
 -------------------------------------------------------------------------------
 
--- target.lua reports the kill via OnTargetClicked with ITS MULTIPLIER
--- (from its PointsMultiplier script var) — the golden rule lives with the
--- target template, not in this file. We combine it with the combo-based
--- base and clamp both: trust, but verify — clients lie.
---
--- NOTE: there is NO tween here on purpose. The target owns its death
--- animation (target.lua onClick); tweening scale from BOTH sides would
--- fight over locked fields. We own bookkeeping + juice, they own looks.
-function OnTargetClicked(controlId, multiplier)
+-- target.lua reports (controlId, kind, multiplier). All scoring POLICY —
+-- combo, fever, upgrades, penalties — lives here.
+function OnTargetClicked(controlId, kind, multiplier)
     if state ~= State.PLAYING or paused then return end
     local t = liveTargets[controlId]
     if not t then return end -- already claimed (double-click race)
 
     liveTargets[controlId] = nil
     slotOccupied[t.slot] = nil
-    -- The target is about to squish (target.lua animates AFTER reporting,
-    -- so our kill lands before its tween locks the scale fields). Force-
-    -- complete the pop-in: the squish should start from full size.
     if t.popTween then
         t.popTween:Kill(true)
         t.popTween = nil
@@ -648,68 +567,120 @@ function OnTargetClicked(controlId, multiplier)
     local slotControl = ui.slots[t.slot]
     local x, y = slotControl:GetAnchoredPosition()
 
+    -- BOMB: no points, breaks combo/fever, costs score. Never below zero.
+    if kind == KIND_BOMB then
+        score = math.max(0, score - BOMB_PENALTY)
+        bombs = bombs + 1
+        resetCombo()
+        playSfx(BOMB_SFX_ID)
+        spawnPopup(x, y, txt("minigame.bomb"), COLOR_BOMB_POPUP)
+        refreshHudAll()
+        return
+    end
+
+    -- TIME: adds seconds, capped at the round's starting duration.
+    if kind == KIND_TIME then
+        timeBonuses = timeBonuses + 1
+        timeLeft = math.min(roundDuration, timeLeft + TIME_BONUS_SECONDS)
+        playSfx(TIME_SFX_ID)
+        spawnPopup(x, y, txt("minigame.time_bonus"), COLOR_TIME_POPUP)
+        return
+    end
+
+    -- Scoring kinds: normal (1), silver (2), golden (3).
     hits = hits + 1
     combo = combo + 1
     bestCombo = math.max(bestCombo, combo)
 
-    local h = helpers()
-    local base = h and h:Invoke("PointsFor", combo) or 10
-    local mult = math.min(5, math.max(1, tonumber(multiplier) or 1))
-    local points = base * mult
+    -- Fever turns on the moment the combo reaches the (upgradeable) threshold
+    -- and lasts until the combo breaks.
+    local feverStarted = false
+    if not fever and combo >= feverThreshold then
+        fever = true
+        feverStarted = true
+    end
+
+    local hp = rootScript("minigame/helpers")
+    local base = hp and hp:Invoke("PointsFor", combo) or 10
+    local mult = clamp(tonumber(multiplier) or 1, 1, 10)
+    if kind == KIND_GOLDEN then
+        mult = hp and hp:Invoke("GoldenMultiplier", mult, goldTier) or mult
+    end
+    local points = base * mult * (fever and FEVER_POINTS_MULTIPLIER or 1)
     score = score + points
 
-    playSfx(HIT_SFX_ID)
-    -- Golden hits pop in gold: the `golden` flag the spawn stored is the
-    -- same truth the template's PointsMultiplier encodes — use it for juice.
-    spawnPopup(x, y, "+" .. points, t.golden and COLOR_GOLD_POPUP or nil)
-    refreshHud()
+    playSfx(feverStarted and FEVER_SFX_ID or HIT_SFX_ID)
+    if feverStarted then
+        local h = hud()
+        if h then h:Invoke("FeverFlash") end
+    end
+    spawnPopup(x, y, "+" .. points,
+        kind == KIND_GOLDEN and COLOR_GOLD_POPUP or nil)
+    refreshHudAll()
 end
 
-function OnReplayRequested()
-    if state == State.IDLE then startRound() end
+-- Start a specific level (game_flow / server signal). Returns true on start.
+function StartLevel(levelId)
+    return startLevel(levelId)
 end
 
--- Pause menu buttons call this (it's on the director, so pause state stays
--- in ONE place instead of being duplicated across scripts).
+-- Stop the current run WITHOUT showing results (quit/restart). game_flow
+-- decides where the player goes next.
+function AbortLevel()
+    if state ~= State.IDLE then stopRound(false) end
+end
+
+-- Pause menu "Resume" button (wired by game_flow).
 function OnResumeRequested()
     if paused then setPaused(false) end
-end
-
--- Called by pause_menu's "Quit" button: end the round without results.
-function OnQuitRequested()
-    if paused then setPaused(false) end
-    if state == State.PLAYING then endRound() end
 end
 
 function GetState()
     return STATE_NAMES[state] or "UNKNOWN"
 end
 
--- Debug support for debug_hud.lua: one formatted line of live state.
--- Keeping the readout ON the director means the HUD never pokes at the
--- director's internals — same rule as everything else: one owner per
--- piece of state, everyone else asks nicely via Invoke.
+function GetLevel()
+    return currentLevel
+end
+
+function GetRoundDuration()
+    return roundDuration
+end
+
+-- Debug/testing helper: force every spawn to one kind until cleared (0).
+-- Used by the automated tests and handy for previewing target art in-editor.
+function OverrideKind(kindCode)
+    local k = tonumber(kindCode) or 0
+    kindOverride = (k >= 1 and k <= 5) and k or 0
+end
+
+-- Debug/testing helper: spawn immediately if a slot is free.
+function DebugSpawn()
+    if state == State.PLAYING and not paused then
+        spawnTarget()
+    end
+end
+
 function GetDebugLine()
     local n = 0
     for _ in pairs(liveTargets) do n = n + 1 end
-    return string.format("%s score=%d combo=%d best=%d hits=%d miss=%d gold=%d%% targets=%d",
-        STATE_NAMES[state] or "?", score, combo, bestCombo, hits, misses,
-        math.floor(goldenRate * 100 + 0.5), n)
+    return string.format(
+        "lvl=%d %s score=%d combo=%d best=%d hits=%d miss=%d bomb=%d time+=%d fever=%s targets=%d",
+        currentLevel, STATE_NAMES[state] or "?", score, combo, bestCombo,
+        hits, misses, bombs, timeBonuses, tostring(fever), n)
 end
 
 -------------------------------------------------------------------------------
--- Teardown. Controls die on loading screens; so must our tweens and audio,
--- or they play on destroyed objects or leak into the next stage.
+-- Teardown
 -------------------------------------------------------------------------------
+
 function OnDestroy()
-    for t in pairs(activeTweens) do
-        t:Kill(false) -- false = don't force-complete, just stop
-    end
+    for t in pairs(activeTweens) do t:Kill(false) end
     activeTweens = {}
     for audioId in pairs(playingAudio) do
         if game.IsAudioAlive(audioId) then game.StopAudio(audioId) end
     end
     playingAudio = {}
-    if paused then game.PauseLevelTime(false) end -- never leave time frozen
-    print("[SmashGarden] destroyed — cleaned up tweens and audio")
+    if paused then game.PauseLevelTime(false) end
+    print("[director] destroyed — cleaned up tweens and audio")
 end

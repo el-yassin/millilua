@@ -72,6 +72,7 @@ M.roots = {}           -- [name] = control
 -------------------------------------------------------------------------------
 
 local TEXTS = {
+    -- core / HUD
     ["minigame.score"]       = "Score: %d",
     ["minigame.combo"]       = "Combo: %d",
     ["minigame.best"]        = "Best: %d",
@@ -79,6 +80,64 @@ local TEXTS = {
     ["minigame.stats"]       = "Hits: %d  Misses: %d  Best Combo: %d",
     ["minigame.countdown"]   = "%d",
     ["minigame.go"]          = "GO!",
+    ["minigame.fever"]       = "FEVER!",
+    ["minigame.bomb"]        = "-15",
+    ["minigame.time_bonus"]  = "+3s",
+    ["minigame.hud_level"]   = "Level %d — Target %d",
+    ["minigame.coins"]       = "Coins: %d",
+    -- title screen
+    ["minigame.title"]       = "SMASH GARDEN",
+    ["minigame.subtitle"]    = "Whack your way to a perfect harvest!",
+    ["minigame.press_start"] = "Press Start",
+    -- main menu
+    ["minigame.play"]        = "Play",
+    ["minigame.shop"]        = "Garden Shop",
+    ["minigame.stats_title"] = "Garden Records",
+    ["minigame.back"]        = "Back",
+    -- level select
+    ["minigame.level_select"]  = "Choose a Patch",
+    ["minigame.level_locked"]  = "Locked",
+    ["minigame.level.name.1"]  = "First Sprouts",
+    ["minigame.level.name.2"]  = "Golden Hour",
+    ["minigame.level.name.3"]  = "Silver Lining",
+    ["minigame.level.name.4"]  = "Weedy Business",
+    ["minigame.level.name.5"]  = "Time Thief",
+    ["minigame.level.name.6"]  = "Pressure Pot",
+    ["minigame.level.name.7"]  = "Combo Garden",
+    ["minigame.level.name.8"]  = "Bomb Squad",
+    ["minigame.level.name.9"]  = "Golden Rush",
+    ["minigame.level.name.10"] = "Marathon Patch",
+    ["minigame.level.name.11"] = "Perfect Patch",
+    ["minigame.level.name.12"] = "Grand Harvest",
+    -- shop
+    ["minigame.shop.time_name"]  = "Longer Rounds",
+    ["minigame.shop.time_desc"]  = "+2s per round",
+    ["minigame.shop.gold_name"]  = "Golden Touch",
+    ["minigame.shop.gold_desc"]  = "+1 golden target value",
+    ["minigame.shop.combo_name"] = "Combo Master",
+    ["minigame.shop.combo_desc"] = "Fever starts 1 combo earlier",
+    ["minigame.shop.tier"]       = "Lv %d/%d",
+    ["minigame.shop.max"]        = "MAX",
+    ["minigame.shop.price"]      = "%d",
+    -- stats
+    ["minigame.stats.cleared"] = "Patches cleared: %d/%d",
+    ["minigame.stats.rounds"]  = "Rounds played: %d",
+    ["minigame.stats.smashes"] = "Total smashes: %d",
+    ["minigame.stats.best"]    = "Best score: %d",
+    -- results
+    ["minigame.results_title"] = "Harvest Report",
+    ["minigame.complete"]      = "Patch cleared!",
+    ["minigame.failed"]        = "Target missed — try again!",
+    ["minigame.coins_earned"]  = "+%d coins",
+    ["minigame.new_best"]      = "NEW BEST!",
+    ["minigame.next"]          = "Next",
+    ["minigame.replay"]        = "Replay",
+    ["minigame.menu"]          = "Menu",
+    -- pause
+    ["minigame.paused"]        = "Paused",
+    ["minigame.pause.resume"]  = "Resume",
+    ["minigame.pause.restart"] = "Restart",
+    ["minigame.pause.quit"]    = "Quit",
 }
 
 -------------------------------------------------------------------------------
@@ -91,9 +150,18 @@ M.Enum = {
         KeyboardInteractKeyUp = "KeyboardInteractKeyUp",
         KeyboardDropKeyUp = "KeyboardDropKeyUp",
         KeyboardOpenShortcutWheelKeyUp = "KeyboardOpenShortcutWheelKeyUp",
+        KeyboardMoveForwardKeyUp = "KeyboardMoveForwardKeyUp",
+        KeyboardMoveBackwardKeyUp = "KeyboardMoveBackwardKeyUp",
+        KeyboardMoveLeftKeyUp = "KeyboardMoveLeftKeyUp",
+        KeyboardMoveRightKeyUp = "KeyboardMoveRightKeyUp",
         ControllerJumpKeyUp = "ControllerJumpKeyUp",
         ControllerInteractKeyUp = "ControllerInteractKeyUp",
         ControllerMenuBackKeyUp = "ControllerMenuBackKeyUp",
+    },
+    ControllerNavigationEventType = {
+        Confirm = "Confirm", Cancel = "Cancel",
+        Focus = "Focus", LostFocus = "LostFocus",
+        Enter = "Enter", Exit = "Exit", Direction = "Direction",
     },
     EaseType = { OutBack = "OutBack", InBack = "InBack",
                  OutCubic = "OutCubic", InOutSine = "InOutSine" },
@@ -266,6 +334,7 @@ function M.newControl(name, parent)
         scripts = {},      -- [scriptPath] = script instance
         cursorListeners = {}, -- [eventType] = { fn, ... }
         keyListeners = {},    -- [keyType] = { fn, ... }
+        navListeners = {},    -- [navEventType] = { fn, ... }
     }, Control)
     if parent then
         table.insert(parent.children, c)
@@ -317,6 +386,12 @@ function Control:AddKeyEventListener(keyType, fn)
     table.insert(list, fn)
 end
 
+function Control:AddNavigationEventListener(eventType, fn)
+    local list = self.navListeners[eventType]
+    if not list then list = {}; self.navListeners[eventType] = list end
+    table.insert(list, fn)
+end
+
 -- Is the control in a state where the engine would deliver events?
 local function chainActive(c)
     while c do
@@ -326,6 +401,17 @@ local function chainActive(c)
     return true
 end
 M.chainActive = chainActive
+
+-- A click needs the whole ancestor CHAIN visible, not just the control:
+-- a hidden screen swallows clicks on its buttons.
+local function chainVisible(c)
+    while c do
+        if not c.visible then return false end
+        c = c.parent
+    end
+    return true
+end
+M.chainVisible = chainVisible
 
 local function detach(c)
     if c.parent then
@@ -566,9 +652,19 @@ function M.fireKey(control, keyType)
     return false
 end
 
+function M.fireNav(control, navType)
+    if not control or not control.alive or not chainActive(control) then
+        return false
+    end
+    for _, fn in ipairs(control.navListeners[navType] or {}) do
+        fn() -- nav callbacks return nil by API contract; nothing to chain on
+    end
+    return true
+end
+
 function M.fireClick(control)
     if not control or not control.alive or not chainActive(control)
-       or not control.visible then
+       or not chainVisible(control) then
         return false
     end
     for _, fn in ipairs(control.cursorListeners[M.Enum.CursorEventType.CursorClick] or {}) do
